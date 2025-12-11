@@ -1,0 +1,235 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Drowsiness Demo - Live Camera</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; max-width:1100px; margin:auto; }
+    .row { display:flex; gap:24px; align-items:flex-start; }
+    .card { background:#fff; padding:16px; border-radius:8px; box-shadow:0 2px 6px rgba(0,0,0,0.08); }
+    video, canvas { border-radius:6px; display:block; }
+    #videoWrap { position:relative; width:640px; height:480px; }
+    #liveVideo { width:640px; height:480px; background:#000; }
+    #overlay { position:absolute; left:0; top:0; width:640px; height:480px; pointer-events:none; }
+    .controls { margin-top:8px; }
+    button { padding:8px 12px; margin-right:8px; }
+  </style>
+</head>
+<body>
+  <h2>YOLO Drowsiness Detection — Live Camera</h2>
+
+  <div class="row">
+    <div class="card">
+      <h3>Live Camera (browser capture)</h3>
+      <div id="videoWrap">
+        <video id="liveVideo" autoplay muted playsinline></video>
+        <canvas id="overlay" width="640" height="480"></canvas>
+      </div>
+
+      <div class="controls">
+        <button id="startBtn">Start Camera</button>
+        <button id="stopBtn" disabled>Stop Camera</button>
+        <button id="soundBtn">Sound: ON</button>
+        <label style="margin-left:12px">Interval (ms):
+          <input id="intervalInput" type="number" value="500" style="width:80px; margin-left:6px;">
+        </label>
+      </div>
+      <div style="margin-top:8px;">
+        <small>Note: Allow webcam access. Detection may lag on low-end machines; increase interval to reduce CPU load.</small>
+      </div>
+    </div>
+
+    <div class="card" style="flex:1;">
+      <h3>Upload image (existing)</h3>
+      <!-- keep your existing upload form unchanged -->
+      <form id="uploadForm" enctype="multipart/form-data">
+        <input type="file" id="imageInput" name="image" accept="image/*" />
+        <button type="submit">Upload & Detect</button>
+      </form>
+      <div style="margin-top:12px;">
+        <label>Annotated image</label><br>
+        <img id="annotated" style="max-width:100%; border:1px solid #eee;">
+      </div>
+      <pre id="output" style="margin-top:12px; background:#fafafa; padding:8px;"></pre>
+    </div>
+  </div>
+
+<script>
+(async () => {
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const soundBtn = document.getElementById('soundBtn');
+  const intervalInput = document.getElementById('intervalInput');
+
+  const video = document.getElementById('liveVideo');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+
+  let stream = null;
+  let running = false;
+  let intervalId = null;
+  let soundOn = true;
+
+  // simple beep
+  const beep = () => {
+    if (!soundOn) return;
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sine';
+    o.frequency.value = 900;
+    g.gain.value = 0.1;
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start();
+    setTimeout(() => { o.stop(); audioCtx.close(); }, 180);
+  };
+
+  function drawBoxes(preds, scaleX=1, scaleY=1) {
+    // clear overlay
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    ctx.lineWidth = 2;
+    ctx.font = "16px Arial";
+    preds.forEach(p => {
+      const [x1,y1,x2,y2] = p.xyxy;
+      const w = (x2 - x1);
+      const h = (y2 - y1);
+      // choose color by class
+      let color = "green";
+      if (p.class === "closed") color = "orange";
+      else if (p.class === "yawn") color = "green";
+      else if (p.class === "open") color = "blue";
+
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x1*scaleX, y1*scaleY, w*scaleX, h*scaleY);
+      const label = `${p.class} ${p.conf.toFixed(2)}`;
+      // label background
+      const textW = ctx.measureText(label).width;
+      const ly = Math.max(0, y1*scaleY - 20);
+      ctx.fillRect(x1*scaleX, ly, textW + 8, 20);
+      ctx.fillStyle = "#000";
+      ctx.fillText(label, x1*scaleX + 4, ly + 15);
+      ctx.fillStyle = color;
+    });
+  }
+
+  async function sendFrameAndGetPreds(blob) {
+    const fd = new FormData();
+    fd.append('image', blob, 'frame.jpg');
+    try {
+      const res = await fetch('/predict_frame', { method: 'POST', body: fd });
+      if (!res.ok) {
+        // server returned error
+        const txt = await res.text();
+        console.warn('Server error:', txt);
+        return null;
+      }
+      const data = await res.json();
+      return data.predictions || [];
+    } catch (e) {
+      console.error('Request failed', e);
+      return null;
+    }
+  }
+
+  // capture current video frame into blob
+  function captureFrameToBlob() {
+    const tmp = document.createElement('canvas');
+    tmp.width = video.videoWidth;
+    tmp.height = video.videoHeight;
+    const tctx = tmp.getContext('2d');
+    tctx.drawImage(video, 0, 0, tmp.width, tmp.height);
+    return new Promise(resolve => {
+      tmp.toBlob(blob => resolve({ blob, w: tmp.width, h: tmp.height }), 'image/jpeg', 0.7);
+    });
+  }
+
+  async function processFrameLoop() {
+    if (!running) return;
+    const { blob, w, h } = await captureFrameToBlob();
+    const preds = await sendFrameAndGetPreds(blob);
+    if (preds === null) {
+      // error; do nothing
+    } else {
+      // scale preds to canvas size (our overlay is 640x480)
+      const scaleX = overlay.width / w;
+      const scaleY = overlay.height / h;
+      drawBoxes(preds, scaleX, scaleY);
+
+      // if any drowsy class present -> beep
+      const hasDrowsy = preds.some(p => (p.class === 'closed' || p.class === 'yawn') && p.conf > 0.2);
+      if (hasDrowsy) beep();
+    }
+
+    // schedule next frame
+    const interval = Math.max(200, parseInt(intervalInput.value || 500));
+    intervalId = setTimeout(processFrameLoop, interval);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    if (running) return;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+      video.srcObject = stream;
+      running = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+
+      // wait until video ready
+      video.onloadedmetadata = () => {
+        video.play();
+        // set overlay size to video natural size scaled to 640x480 box
+        overlay.width = 640;
+        overlay.height = 480;
+        processFrameLoop();
+      };
+    } catch (err) {
+      alert('Cannot access camera: ' + err);
+      console.error(err);
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    if (!running) return;
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    clearTimeout(intervalId);
+    // stop camera tracks
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    video.pause();
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+  });
+
+  soundBtn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    soundBtn.textContent = 'Sound: ' + (soundOn ? 'ON' : 'OFF');
+  });
+
+  // Keep your upload form handler (if present). If you replaced file, ensure it still exists.
+  const uploadForm = document.getElementById('uploadForm');
+  if (uploadForm) {
+    uploadForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fileEl = document.getElementById('imageInput');
+      if (!fileEl || !fileEl.files.length) return alert('Select a file');
+      const fd = new FormData();
+      fd.append('image', fileEl.files[0]);
+      const res = await fetch('/upload', { method: 'POST', body: fd });
+      const data = await res.json();
+      document.getElementById('output').textContent = JSON.stringify(data, null, 2);
+      if (data.annotated_image) {
+        document.getElementById('annotated').src = `/static/uploads/${data.annotated_image}?t=${Date.now()}`;
+      }
+    });
+  }
+
+})();
+</script>
+</body>
+</html>
